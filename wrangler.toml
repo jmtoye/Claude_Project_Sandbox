@@ -1,0 +1,40 @@
+# Cloudflare Worker configuration for the private project dashboard.
+# See docs/SETUP.md. Values marked REPLACE must be filled in before deploying.
+name = "project-dashboard"
+main = "src/server/worker.ts"
+compatibility_date = "2026-09-29"
+# Preview URLs would expose un-gated copies of the Worker; the app still requires a valid
+# Access token, but keep them off so Access is the only way in.
+preview_urls = false
+
+# Every request (including the static UI shell) runs through the Worker first,
+# so authentication is checked before anything is served.
+[assets]
+directory = "./dist/client"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "project-dashboard"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Hourly: check tracked sources; the same run produces the 07:00 Asia/Hong_Kong
+# daily summary (23:00 UTC run) and catches up if that run was missed.
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+OWNER_EMAIL = "REPLACE_WITH_YOUR_SIGN_IN_EMAIL"
+# Comma-separated emails allowed to be granted the Personal space (besides the owner).
+PERSONAL_ALLOWED_EMAILS = ""
+# Cloudflare Access (Zero Trust) team domain and application audience tag.
+ACCESS_TEAM_DOMAIN = "REPLACE.cloudflareaccess.com"
+ACCESS_AUD = "REPLACE_WITH_ACCESS_APPLICATION_AUD"
+APP_URL = "https://project-dashboard.REPLACE.workers.dev"
+ANTHROPIC_MODEL = "claude-opus-5-5"
+SUMMARY_FROM_EMAIL = ""
+# Secrets (set with `wrangler secret put NAME`, never committed):
+#   ANTHROPIC_API_KEY, RESEND_API_KEY, GITHUB_TOKEN, NOTION_TOKEN

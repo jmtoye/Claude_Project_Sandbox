@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+*.sqlite
+*.sqlite-journal
+*.db
+test-results/
+playwright-report/
+.local/
+
+# Real project data stays out of git while this repository is PUBLIC.
+# Delete this line once the repository is private to version the initial project.
+data/initial-projects.json
