@@ -40,8 +40,11 @@ async function main() {
   const db = new SqliteDb(DB_PATH);
   db.migrate(join(ROOT, 'migrations'));
   const signer = DEV ? await createDevSigner() : null;
+  // Dev mode never picks up ambient credentials from the shell unless asked to (DEV_USE_ENV_SECRETS=1).
+  const inherited: Record<string, string | undefined> = { ...process.env };
+  if (DEV && process.env.DEV_USE_ENV_SECRETS !== '1') for (const k of ['GITHUB_TOKEN', 'NOTION_TOKEN', 'ANTHROPIC_API_KEY', 'RESEND_API_KEY']) delete inherited[k];
   const env = {
-    ...process.env,
+    ...inherited,
     ...(DEV ? { OWNER_EMAIL: DEV_USERS.owner, PERSONAL_ALLOWED_EMAILS: DEV_USERS.renata, ACCESS_TEAM_DOMAIN: DEV_TEAM, ACCESS_AUD: DEV_AUD, APP_URL: `http://localhost:${PORT}` } : {}),
   };
   const config = loadConfig(env);
