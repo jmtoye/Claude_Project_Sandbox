@@ -183,7 +183,7 @@ export async function runDailySummaries(deps: Deps): Promise<SummaryRunResult> {
   for (const u of users) {
     let principal: Principal;
     try {
-      principal = await principalForEmail(deps, u.email, 'dev');
+      principal = await principalForEmail(deps, u.email, 'dev', { touch: false }); // not a real visit
     } catch {
       continue;
     }
@@ -225,15 +225,16 @@ export async function runScheduled(deps: Deps): Promise<{ refresh: unknown; summ
   await deps.db.run("INSERT INTO app_meta (key, value) VALUES ('last_cron_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [now.toISOString()]);
   let refresh: unknown;
   let summaries: unknown;
-  try {
-    refresh = await runRefresh(deps, { trigger: 'cron', idemKey: `cron:${now.toISOString().slice(0, 13)}` });
-  } catch (e) {
-    refresh = { error: String(e) };
-  }
+  // Summaries first, so a long source refresh can never push the 07:00 summary past the run limit.
   try {
     summaries = await runDailySummaries(deps);
   } catch (e) {
     summaries = { error: String(e) };
+  }
+  try {
+    refresh = await runRefresh(deps, { trigger: 'cron', idemKey: `cron:${now.toISOString().slice(0, 13)}` });
+  } catch (e) {
+    refresh = { error: String(e) };
   }
   return { refresh, summaries };
 }

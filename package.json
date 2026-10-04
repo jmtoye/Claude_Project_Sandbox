@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Private live project dashboard (Cloudflare Workers + D1 + Access)",
   "scripts": {
-    "dev": "tsx dev/node-server.ts",
+    "dev": "DEV_LOGIN=1 tsx dev/node-server.ts",
     "dev:client": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",

@@ -101,7 +101,10 @@ function jsonSchema(s: z.ZodType) {
 }
 
 function listTools(p: Principal) {
-  const tools = Object.entries(READ_TOOLS).map(([name, t]) => ({ name, description: t.description, inputSchema: jsonSchema(t.schema), annotations: { readOnlyHint: name !== 'refresh_sources' } }));
+  const mayRefresh = canEdit(p, 'personal') || canEdit(p, 'work');
+  const tools = Object.entries(READ_TOOLS)
+    .filter(([name]) => name !== 'refresh_sources' || mayRefresh)
+    .map(([name, t]) => ({ name, description: t.description, inputSchema: jsonSchema(t.schema), annotations: { readOnlyHint: name !== 'refresh_sources' } }));
   for (const name of permittedOps(p)) tools.push({ name, description: OPS[name].summary, inputSchema: jsonSchema(OPS[name].schema), annotations: { readOnlyHint: false } });
   return tools;
 }

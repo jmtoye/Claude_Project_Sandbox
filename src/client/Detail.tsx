@@ -122,7 +122,7 @@ export function Detail(props: Props) {
           <span class={`flag prio ${d.priority}`}>{d.priority} priority</span>
           {d.lifecycle !== 'active' && <span class="flag prio">{d.lifecycle}</span>}
           {d.only_me && <span class="basis override">Only me</span>}
-          {d.canonical_url && (
+          {/^https?:\/\//i.test(d.canonical_url) && (
             <a class="btn small" href={d.canonical_url} target="_blank" rel="noopener noreferrer">
               Open project page ↗
             </a>
@@ -443,7 +443,7 @@ function Milestone({ m, i, today, edit, busy, op, sources }: { m: MilestoneDTO; 
   const [editing, setEditing] = useState(false);
   const [f, setF] = useState({ title: m.title, weight: m.weight, target_date: m.target_date ?? '', deadline: m.deadline ?? '', note: '', evidence: m.evidence });
   const src = sources.find((s) => s.id === m.evidence_source_id);
-  const evidenceLabel = { owner_confirmed: 'Confirmed by you', source_fact: 'From source', auto_evidence: 'Automatic, from source', '': '' }[m.evidence_basis];
+  const evidenceLabel = { owner_confirmed: 'Confirmed manually', source_fact: 'From source', auto_evidence: 'Automatic, from source', '': '' }[m.evidence_basis];
   const save = async (e: Event) => {
     e.preventDefault();
     let ok = true;
@@ -744,7 +744,7 @@ function Source({ s, edit, op }: { s: SourceDTO; edit: boolean; op: OpFn }) {
       <div class="row">
         <span class={`conn ${s.connection}`}>{s.connection.replace('_', ' ')}</span>
         <span class="title grow">
-          {s.url ? (
+          {/^https?:\/\//i.test(s.url) ? (
             <a href={s.url} target="_blank" rel="noopener noreferrer">
               {s.title} ↗
             </a>

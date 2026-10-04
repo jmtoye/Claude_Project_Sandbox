@@ -2,7 +2,7 @@
 import { Hono, type Context } from 'hono';
 import { ZodError } from 'zod';
 import type { DashboardResponse, MapResponse, Space, SystemHealth } from '../shared/types';
-import { authenticate, canEdit, canView, projectScope, visibleSpaces, type Principal } from './auth/principal';
+import { authenticate, canEdit, canView, projectScope, requireWriteAccess, visibleSpaces, type Principal } from './auth/principal';
 import { emailConfigured, type Deps } from './config';
 import { compareTiles } from './domain/attention';
 import { PROGRESS_EXPLANATION } from './domain/progress';
@@ -229,6 +229,7 @@ export function createApp(getDeps: (c: Context) => Deps, opts: AppOptions = {}) 
   });
 
   app.post('/api/me/preferences', async (c) => {
+    requireWriteAccess(me(c));
     const body = await c.req.json<{ summary_email?: boolean }>();
     if (typeof body.summary_email === 'boolean') await admin.setSummaryEmail(deps(c), me(c), body.summary_email);
     return c.json({ ok: true });

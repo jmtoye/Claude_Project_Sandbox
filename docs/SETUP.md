@@ -90,6 +90,6 @@ Press Esc to exit. To switch between Personal and Work, use the tabs; they never
 ## Local development
 ```bash
 SEED=synthetic npm run dev     # http://localhost:8787/__dev/login — 20+ SYNTHETIC test projects in .local/
-npm run check                  # typecheck + 51 tests + browser tests (4K projector layout)
+npm run check                  # typecheck + 74 tests + browser tests (4K projector layout)
 ```
 Synthetic data only ever goes into the local `.local/` database, never into the deployed dashboard.

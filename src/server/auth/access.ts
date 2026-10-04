@@ -15,7 +15,8 @@ export function remoteJwks(url: string, fetchFn: typeof fetch, ttlMs = 3_600_000
   let cache: { keys: Jwk[]; at: number } | null = null;
   return async (force = false) => {
     if (!url) throw new Error('Access signing-key URL is not configured');
-    if (!force && cache && Date.now() - cache.at < ttlMs) return cache.keys;
+    // Forced refreshes (unknown key id) are rate-limited so junk tokens cannot trigger a fetch per request.
+    if (cache && Date.now() - cache.at < (force ? 60_000 : ttlMs)) return cache.keys;
     const res = await fetchFn(url, { headers: { accept: 'application/json' } });
     if (!res.ok) throw new Error(`Fetching Access signing keys failed: HTTP ${res.status}`);
     const body = (await res.json()) as { keys?: Jwk[] };
@@ -81,12 +82,12 @@ export async function verifyAccessJwt(token: string, opts: VerifyOptions): Promi
   }
   if (!jwk) return null;
 
-  const ok = await crypto.subtle.verify(
-    'RSASSA-PKCS1-v1_5',
-    await importKey(jwk),
-    b64urlDecode(parts[2]),
-    new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
-  );
+  let ok = false;
+  try {
+    ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', await importKey(jwk), b64urlDecode(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
+  } catch {
+    return null; // malformed signature encoding
+  }
   if (!ok) return null;
 
   const nowSec = Math.floor(opts.now.getTime() / 1000);
@@ -106,5 +107,10 @@ export function readAccessToken(req: Request): string | null {
   if (header) return header;
   const cookie = req.headers.get('cookie') ?? '';
   const m = cookie.match(/(?:^|;\s*)CF_Authorization=([^;]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
 }

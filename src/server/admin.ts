@@ -2,7 +2,7 @@
 // separately), personal access tokens, import/export and integration status.
 import { z } from 'zod';
 import type { Space } from '../shared/types';
-import { TOKEN_PREFIX, canOwnerWrite, type Principal } from './auth/principal';
+import { TOKEN_PREFIX, canOwnerWrite, requireWriteAccess, type Principal } from './auth/principal';
 import { authConfigured, emailConfigured, type Deps } from './config';
 import type { Stmt } from './db';
 import { sourceInsert } from './ops';
@@ -98,6 +98,7 @@ export async function revokeUser(deps: Deps, p: Principal, userId: string) {
 }
 
 export async function setSummaryEmail(deps: Deps, p: Principal, enabled: boolean) {
+  requireWriteAccess(p);
   await deps.db.run('UPDATE users SET summary_email = ? WHERE id = ?', [enabled ? 1 : 0, p.userId]);
   return { ok: true };
 }
@@ -120,6 +121,7 @@ export async function createToken(deps: Deps, p: Principal, body: unknown) {
 }
 
 export async function revokeToken(deps: Deps, p: Principal, id: string) {
+  requireWriteAccess(p);
   const r = await deps.db.run('UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL', [deps.now().toISOString(), id, p.userId]);
   if (!r.changes) throw notFound();
   return { ok: true };
@@ -191,15 +193,21 @@ const ImportProject = z.object({
   pinned: z.union([z.boolean(), z.number()]).default(false),
   only_me: z.union([z.boolean(), z.number()]).default(false),
   lifecycle: z.enum(['active', 'paused', 'completed', 'archived']).default('active'),
-  canonical_url: z.string().default(''),
+  canonical_url: z.string().default('').refine((u) => !u || /^https?:\/\//i.test(u), 'canonical_url must be http(s)'),
   milestones: z.array(ImportMilestone).default([]),
   next_steps: z
     .array(z.object({ title: z.string(), assignee: z.string().default(''), due_date: z.string().nullable().default(null), needs_decision: z.union([z.boolean(), z.number()]).default(false), is_primary: z.union([z.boolean(), z.number()]).default(false), basis: z.enum(['manual', 'source_fact', 'suggestion']).default('manual'), citation: z.any().optional() }))
     .default([]),
   issues: z.array(z.object({ kind: z.enum(['blocker', 'risk', 'tip']), title: z.string(), detail: z.string().default(''), severity: z.enum(['high', 'medium', 'low']).default('medium'), basis: z.enum(['manual', 'source_fact', 'suggestion']).default('manual'), citation: z.any().optional() })).default([]),
   sources: z
-    .array(z.object({ kind: z.enum(['web', 'github', 'notion', 'snapshot', 'reference']).optional(), role: z.enum(['canonical', 'supporting', 'decision', 'workstream']).default('supporting'), title: z.string().default(''), url: z.string().default(''), snapshot_text: z.string().default(''), as_of: z.string().nullable().default(null) }))
+    .array(
+      z
+        .object({ kind: z.enum(['web', 'github', 'notion', 'snapshot', 'reference']).optional(), role: z.enum(['canonical', 'supporting', 'decision', 'workstream']).default('supporting'), title: z.string().default(''), url: z.string().default(''), snapshot_text: z.string().default(''), as_of: z.string().nullable().default(null) })
+        .refine((s) => s.url || s.snapshot_text, 'each source needs a url or snapshot_text')
+        .refine((s) => !s.url || /^https?:\/\//i.test(s.url), 'source urls must be http(s)'),
+    )
     .default([]),
+  dependencies: z.array(z.object({ depends_on_id: z.string(), note: z.string().default('') })).default([]),
   history_note: z.string().optional(),
 });
 
@@ -214,6 +222,7 @@ export async function importProjects(deps: Deps, p: Principal, body: unknown) {
   const now = deps.now().toISOString();
   const created: string[] = [];
   const skipped: string[] = [];
+  const createdIds: { id: string; deps: { depends_on_id: string; note: string }[]; space: string }[] = [];
   for (const pr of parsed.data.projects) {
     if (pr.id && (await deps.db.first('SELECT id FROM projects WHERE id = ?', [pr.id]))) {
       skipped.push(pr.name);
@@ -235,7 +244,7 @@ export async function importProjects(deps: Deps, p: Principal, body: unknown) {
       if (s.snapshot_text) {
         // The snapshot's content is already reflected in the imported record: mark it processed
         // so the updater does not re-derive (and duplicate) the same facts.
-        const text = `Snapshot as of ${s.as_of ?? 'unknown date'}:\n${s.snapshot_text}`;
+        const text = s.snapshot_text;
         const hash = await sha256Hex(text);
         stmts.push(
           { sql: 'UPDATE sources SET content_hash = ?, last_success_at = ?, last_checked_at = ? WHERE id = ?', params: [hash, now, now, srcIds.at(-1)] },
@@ -270,6 +279,17 @@ export async function importProjects(deps: Deps, p: Principal, body: unknown) {
     });
     await deps.db.batch(stmts);
     created.push(pr.name);
+    createdIds.push({ id, deps: pr.dependencies, space: pr.space });
   }
-  return { created, skipped };
+  // Dependencies (from an export) are restored once all projects exist; same-space only.
+  let dependencies = 0;
+  for (const c of createdIds) {
+    for (const d of c.deps) {
+      const other = await deps.db.first<{ space: string }>('SELECT space FROM projects WHERE id = ?', [d.depends_on_id]);
+      if (!other || other.space !== c.space || d.depends_on_id === c.id) continue;
+      const r = await deps.db.run('INSERT INTO dependencies (project_id, depends_on_id, note, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING', [c.id, d.depends_on_id, d.note, now]);
+      dependencies += r.changes;
+    }
+  }
+  return { created, skipped, dependencies };
 }

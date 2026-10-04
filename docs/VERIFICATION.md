@@ -1,6 +1,6 @@
 # Verification and status
 
-Run everything with `npm run check` (typecheck, 59 unit/integration tests, 6 browser tests). Test data is **synthetic** and lives only in in-memory or `.local/` databases.
+Run everything with `npm run check` (typecheck, 74 unit/integration tests, 6 browser tests). Test data is **synthetic** and lives only in in-memory or `.local/` databases.
 
 ## Requested checks
 
@@ -19,6 +19,21 @@ Run everything with `npm run check` (typecheck, 59 unit/integration tests, 6 bro
 | Natural-language commands | All six example requests parse correctly with the rule interpreter; previews change nothing until confirmed; owner-only tools are withheld from editors; ambiguous requests get a clarifying question. | ✅ |
 | MCP | The official MCP TypeScript client connects, lists tools, reads and writes; actions are attributed "(via MCP)"; invalid tokens get 401. Also checked with curl in workerd. | ✅ (not yet with a live Claude Code session) |
 | Initial project | `tests/initial-project.test.ts`: imports with no percentage, deadline or approval; the ChatGPT link stays reference-only and is never fetched; once the plan is confirmed, progress follows the recorded evidence and weights. | ✅ |
+
+## Independent review
+
+A separate review pass audited access control and the updater. Every finding was fixed, and each has a regression test in `tests/review-regressions.test.ts`:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| High | Editors could attach GitHub/Notion sources and have them read with the owner's credentials | Owner-only |
+| Medium | "Only me" names could reach the model while processing other projects | Removed from the model's context |
+| Medium | Status could change without evidence | Grounded quote required |
+| Medium | Weak quote matching (including the app's own snapshot header) | Stricter matching, and state changes must quote new text |
+| Medium | One project's error could abort the whole run | Per-project isolation, rebuilt retries, lock renewal |
+| Lower | Cycle check revealed hidden projects; a stale deadline suggestion could override a newer deadline; read tokens could revoke tokens; the summary job marked everyone as "seen"; import validation and dependency restore; malformed-cookie 500s; non-http links; dev login on by default | All fixed |
+
+Two of the fixes were mutation-tested (reverted, confirmed the tests fail, restored).
 
 ## What is functional vs not yet
 

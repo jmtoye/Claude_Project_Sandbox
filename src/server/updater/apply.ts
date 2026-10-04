@@ -32,14 +32,18 @@ export function planApply(args: {
   const { bundle, proposal: prop, changes, today, now, runId } = args;
   const p = bundle.project;
   const texts = new Map(changes.map((c) => [c.source_id, c.text]));
+  // State changes (status, milestone completion) must be evidenced by text that is new in
+  // this change; old unchanged lines were already considered when they first appeared.
+  const newTexts = new Map(changes.map((c) => [c.source_id, c.first_time ? c.text : c.added.join('\n')]));
   const overridden = new Set(bundle.overrides.map((o) => o.field));
   const stmts: Stmt[] = [];
   const applied: string[] = [];
   const suppressed: string[] = [];
   const allCites: Citation[] = [];
 
-  const valid = (cites: Citation[]) => {
-    const ok = cites.filter((c) => texts.has(c.source_id) && quoteIsGrounded(c.quote, texts.get(c.source_id)!));
+  const valid = (cites: Citation[], scope: 'full' | 'new' = 'full') => {
+    const pool = scope === 'new' ? newTexts : texts;
+    const ok = cites.filter((c) => pool.has(c.source_id) && quoteIsGrounded(c.quote, pool.get(c.source_id)!));
     allCites.push(...ok);
     return ok;
   };
@@ -60,8 +64,8 @@ export function planApply(args: {
 
   // ---- status ----
   if (prop.status) {
-    const cites = valid(prop.status.citations);
-    const basis = prop.status.basis === 'source_fact' && cites.length ? 'source_fact' : 'suggestion';
+    const cites = valid(prop.status.citations, 'new');
+    const basis = prop.status.basis === 'source_fact' ? 'source_fact' : 'suggestion';
     const sets: string[] = [];
     const params: unknown[] = [];
     const fields: [keyof typeof p & string, string][] = [
@@ -71,6 +75,10 @@ export function planApply(args: {
     ];
     for (const [field, value] of fields) {
       if (!value || value === p[field]) continue;
+      if (!cites.length) {
+        suppressed.push(`${field.replace('_', ' ')} → "${clip(value, 80)}": no quote from the newly changed source text`);
+        continue;
+      }
       if (overridden.has(field)) {
         conflictSuggestion(field, value, `${field.replace('_', ' ')}: "${clip(value, 80)}"`, {}, cites);
         continue;
@@ -79,7 +87,12 @@ export function planApply(args: {
       params.push(value);
       applied.push(field === 'status' ? `Status → ${value.replace('_', ' ')}` : `Updated ${field.replace('_', ' ')}`);
     }
-    if (sets.length) stmts.push({ sql: `UPDATE projects SET ${sets.join(', ')}, status_basis = ? WHERE id = ?`, params: [...params, basis, p.id] });
+    // The basis label describes the status value, so only relabel it when the value itself changed.
+    if (sets.some((x) => x.startsWith('status ='))) {
+      sets.push('status_basis = ?');
+      params.push(basis);
+    }
+    if (sets.length) stmts.push({ sql: `UPDATE projects SET ${sets.join(', ')} WHERE id = ?`, params: [...params, p.id] });
   }
 
   // ---- milestones ----
@@ -87,9 +100,9 @@ export function planApply(args: {
   for (const u of prop.milestone_updates) {
     const m = byId.get(u.milestone_id);
     if (!m || u.state === m.state) continue;
-    const cites = valid(u.citations);
+    const cites = valid(u.citations, 'new');
     if (!cites.length) {
-      suppressed.push(`Milestone "${clip(m.title, 60)}" → ${u.state.replace('_', ' ')}: no verifiable evidence in the source`);
+      suppressed.push(`Milestone "${clip(m.title, 60)}" → ${u.state.replace('_', ' ')}: no verifiable evidence in the newly changed source text`);
       continue;
     }
     if (overridden.has(`milestone:${m.id}:state`)) {

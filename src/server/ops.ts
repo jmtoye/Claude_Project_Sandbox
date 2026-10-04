@@ -4,7 +4,7 @@
 // optimistic concurrency atomically.
 import { z } from 'zod';
 import type { Space } from '../shared/types';
-import { canEdit, canOwnerWrite, type Principal } from './auth/principal';
+import { canEdit, canOwnerWrite, projectScope, type Principal } from './auth/principal';
 import type { Deps } from './config';
 import { isGuardFailure, versionGuard, type Stmt } from './db';
 import type { IssueRow, MilestoneRow, NextStepRow, ProjectRow } from './rows';
@@ -40,6 +40,11 @@ const STATUS = z.enum(['on_track', 'in_progress', 'at_risk', 'blocked', 'unasses
 const PRIORITY = z.enum(['high', 'medium', 'low']);
 
 const CONFLICT_RETRY = 'internal_version_conflict';
+const httpUrl = z
+  .string()
+  .trim()
+  .max(2000)
+  .refine((u) => u === '' || /^https?:\/\/[^\s]+$/i.test(u), 'Must be an http(s) link');
 
 // ---- helpers --------------------------------------------------------------
 
@@ -121,7 +126,7 @@ export const OPS = {
       space: SPACE,
       name: text(120).min(1),
       phrase: text(140).optional(),
-      canonical_url: text(2000).optional(),
+      canonical_url: httpUrl.optional(),
       priority: PRIORITY.optional(),
       status_summary: text(300).optional(),
       only_me: z.boolean().optional(),
@@ -156,7 +161,7 @@ export const OPS = {
       priority: PRIORITY.optional(),
       needs_attention: z.boolean().optional(),
       attention_note: text(300).optional(),
-      canonical_url: text(2000).optional(),
+      canonical_url: httpUrl.optional(),
       expected_version: expected,
     }),
     async run(ctx, a) {
@@ -604,7 +609,7 @@ export const OPS = {
       'Attach a source to a tracked project: a URL (web page, GitHub file, Notion page — checked hourly when connected; ChatGPT/Google/claude.ai links are kept as reference-only) or a pasted dated snapshot.',
     schema: z.object({
       project_id: pid,
-      url: text(2000).optional(),
+      url: httpUrl.optional(),
       title: text(200).optional(),
       role: z.enum(['canonical', 'supporting', 'decision', 'workstream']).optional(),
       snapshot_text: text(100_000).optional(),
@@ -613,6 +618,12 @@ export const OPS = {
     async run(ctx, a) {
       const p = await loadProject(ctx, a.project_id, 'edit');
       if (!a.url && !a.snapshot_text) throw badRequest('Provide a URL or snapshot text.');
+      // GitHub and Notion sources are read with the owner's server-side credentials, so only the
+      // owner may attach them (otherwise an editor could read anything those tokens can reach).
+      if (a.url && !a.snapshot_text && !canOwnerWrite(ctx.principal)) {
+        const kind = classifyUrl(a.url, ctx.deps.config).kind;
+        if (kind === 'github' || kind === 'notion') throw forbidden('Only the owner can attach GitHub or Notion sources, because they are read with the owner’s credentials.');
+      }
       const stmts = sourceInsert(ctx, p.id, a);
       stmts.push(historyStmt(ctx, p.id, 'source', `Added source: ${a.title || a.url || 'snapshot'}`));
       await commit(ctx, p, stmts);
@@ -658,6 +669,8 @@ export const OPS = {
       const p = await loadProject(ctx, a.project_id, 'edit');
       const other = await getVisibleProject(ctx.deps.db, ctx.principal, a.depends_on_id);
       if (!other) throw notFound();
+      const exists = await ctx.deps.db.first('SELECT 1 AS x FROM dependencies WHERE project_id = ? AND depends_on_id = ?', [p.id, other.id]);
+      if (!exists) return { message: 'There was no such dependency.', project_id: p.id };
       await commit(ctx, p, [
         { sql: 'DELETE FROM dependencies WHERE project_id = ? AND depends_on_id = ?', params: [p.id, other.id] },
         historyStmt(ctx, p.id, 'dependency', `No longer depends on "${other.name}"`, { related_project_id: other.id }),
@@ -702,7 +715,11 @@ export const OPS = {
         summary = `Accepted suggestion: ${s.rationale}`;
         if (s.kind === 'deadline') {
           const m = await getMilestone(ctx, p.id, String(payload.milestone_id));
+          if ((payload.current ?? null) !== m.deadline) {
+            throw new HttpError(409, 'This suggestion is out of date: the deadline was changed after it was made. Dismiss it, or set the date explicitly.', 'stale_suggestion');
+          }
           stmts.push({ sql: 'UPDATE milestones SET deadline = ?, deadline_note = ?, updated_at = ? WHERE id = ?', params: [payload.date, `Confirmed from source: “${payload.quote ?? ''}”`, now, m.id] });
+          summary = `Accepted deadline for "${m.title}": ${m.deadline ?? 'none'} → ${payload.date} (from source: “${payload.quote ?? ''}”)`;
         } else if (s.kind === 'milestone') {
           const max = await ctx.deps.db.first<{ m: number | null }>('SELECT MAX(position) AS m FROM milestones WHERE project_id = ?', [p.id]);
           stmts.push({
@@ -744,7 +761,9 @@ function applyOverrideConflict(projectId: string, payload: Record<string, unknow
   return out;
 }
 
+/** Cycle check over the dependency graph the requester can see (never reveals hidden projects). */
 async function reaches(ctx: OpCtx, from: string, target: string): Promise<boolean> {
+  const scope = projectScope(ctx.principal, 'o');
   const seen = new Set<string>();
   const stack = [from];
   while (stack.length) {
@@ -752,7 +771,10 @@ async function reaches(ctx: OpCtx, from: string, target: string): Promise<boolea
     if (cur === target) return true;
     if (seen.has(cur)) continue;
     seen.add(cur);
-    const rows = await ctx.deps.db.all<{ d: string }>('SELECT depends_on_id AS d FROM dependencies WHERE project_id = ?', [cur]);
+    const rows = await ctx.deps.db.all<{ d: string }>(
+      `SELECT d.depends_on_id AS d FROM dependencies d JOIN projects o ON o.id = d.depends_on_id WHERE d.project_id = ? AND ${scope.sql}`,
+      [cur, ...scope.params],
+    );
     stack.push(...rows.map((r) => r.d));
   }
   return false;

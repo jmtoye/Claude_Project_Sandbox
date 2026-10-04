@@ -65,7 +65,7 @@ interface UserRow {
   last_seen_at: string | null;
 }
 
-async function loadPrincipal(deps: Deps, user: UserRow, via: Principal['via'], tokenScope?: 'read' | 'write'): Promise<Principal> {
+async function loadPrincipal(deps: Deps, user: UserRow, via: Principal['via'], tokenScope?: 'read' | 'write', touch = true): Promise<Principal> {
   const isOwner = user.email === deps.config.ownerEmail;
   const grants: Principal['grants'] = {};
   if (!isOwner) {
@@ -80,7 +80,7 @@ async function loadPrincipal(deps: Deps, user: UserRow, via: Principal['via'], t
     }
   }
   const now = deps.now();
-  if (!user.last_seen_at || now.getTime() - Date.parse(user.last_seen_at) > 5 * 60_000) {
+  if (touch && (!user.last_seen_at || now.getTime() - Date.parse(user.last_seen_at) > 5 * 60_000)) {
     await deps.db.run('UPDATE users SET last_seen_at = ? WHERE id = ?', [now.toISOString(), user.id]);
   }
   return {
@@ -96,7 +96,7 @@ async function loadPrincipal(deps: Deps, user: UserRow, via: Principal['via'], t
 }
 
 /** Finds the user for a verified email, creating the owner record on first sign-in. */
-export async function principalForEmail(deps: Deps, email: string, via: Principal['via']): Promise<Principal> {
+export async function principalForEmail(deps: Deps, email: string, via: Principal['via'], opts: { touch?: boolean } = {}): Promise<Principal> {
   const lower = email.toLowerCase();
   let user = await deps.db.first<UserRow>('SELECT * FROM users WHERE email = ?', [lower]);
   if (!user && lower === deps.config.ownerEmail) {
@@ -117,7 +117,12 @@ export async function principalForEmail(deps: Deps, email: string, via: Principa
       { sql: 'UPDATE users SET is_owner = 1 WHERE id = ?', params: [user.id] },
     ]);
   }
-  return loadPrincipal(deps, user, via);
+  return loadPrincipal(deps, user, via, undefined, opts.touch ?? true);
+}
+
+/** Read-scoped tokens may only read; this guards the few non-project writes (tokens, preferences). */
+export function requireWriteAccess(p: Principal) {
+  if (p.tokenScope === 'read') throw forbidden('This is a read-only token.');
 }
 
 export const TOKEN_PREFIX = 'pd_';

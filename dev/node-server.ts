@@ -1,11 +1,11 @@
 // Local Node server for development, testing and screenshots.
 //
-//   npm run dev                       # dev mode: local sign-in page, SQLite in .local/
+//   npm run dev                       # DEV_LOGIN=1: local sign-in page, SQLite in .local/
 //   SEED=synthetic npm run dev        # + 20 synthetic Work tiles (local DB only)
 //
 // Dev mode signs Cloudflare-Access-format JWTs with a local key so the production
-// verification code path is exercised. Set ACCESS_TEAM_DOMAIN/ACCESS_AUD (and leave
-// DEV_LOGIN unset) to run behind a real Cloudflare Tunnel + Access instead.
+// verification code path is exercised. Without DEV_LOGIN=1, set ACCESS_TEAM_DOMAIN/ACCESS_AUD
+// to run behind a real Cloudflare Tunnel + Access; otherwise every request is refused (503).
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
@@ -24,7 +24,9 @@ import { createDevSigner, DEV_AUD, DEV_TEAM } from './devauth';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const PORT = Number(process.env.PORT ?? 8787);
-const DEV = process.env.DEV_LOGIN !== '0' && !process.env.ACCESS_TEAM_DOMAIN;
+// Dev sign-in must be switched on explicitly and never combines with a real Access configuration.
+const DEV = process.env.DEV_LOGIN === '1' && !process.env.ACCESS_TEAM_DOMAIN;
+if (DEV && (process.env.HOST ?? '127.0.0.1') !== '127.0.0.1') throw new Error('DEV_LOGIN=1 is only allowed on 127.0.0.1');
 const DB_PATH = process.env.DB_PATH ?? join(ROOT, '.local', 'dev.sqlite');
 
 export const DEV_USERS = {

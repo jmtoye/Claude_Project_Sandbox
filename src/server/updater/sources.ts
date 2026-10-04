@@ -69,11 +69,43 @@ export interface SourceFetchDeps {
   config: Pick<Config, 'githubToken' | 'notionToken'>;
 }
 
-async function timedFetch(f: typeof fetch, url: string, init: RequestInit = {}): Promise<Response> {
+/** Only public http(s) hosts may be fetched (no localhost, private or link-local addresses). */
+export function isPublicHttpUrl(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+  if (u.username || u.password) return false;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.home.arpa') || !h.includes('.') && !h.includes(':')) return false;
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224) return false;
+  }
+  if (h.includes(':')) {
+    if (h === '::1' || h === '::' || /^f[cd]/.test(h) || /^fe[89ab]/.test(h) || h.startsWith('::ffff:')) return false;
+  }
+  return true;
+}
+
+async function timedFetch(f: typeof fetch, url: string, init: RequestInit = {}): Promise<{ res: Response; finalUrl: string }> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await f(url, { ...init, signal: ctrl.signal, redirect: 'follow' });
+    // Follow redirects manually so every hop is re-checked against the public-host rule.
+    let current = url;
+    for (let hop = 0; hop < 5; hop++) {
+      if (!isPublicHttpUrl(current)) throw new Error('Refusing to fetch a non-public address');
+      const res = await f(current, { ...init, signal: ctrl.signal, redirect: 'manual' });
+      const loc = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+      if (!loc) return { res, finalUrl: res.url || current };
+      current = new URL(loc, current).toString();
+    }
+    throw new Error('Too many redirects');
   } finally {
     clearTimeout(t);
   }
@@ -88,7 +120,7 @@ const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"'
 export function htmlToText(html: string): { text: string; title?: string } {
   const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim();
   const text = html
-    .replace(/<(script|style|noscript|svg|template|head)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(script|style|noscript|svg|template|head|title)[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<(br|hr)\s*\/?>/gi, '\n')
     .replace(/<\/(p|div|li|tr|h[1-6]|section|article|blockquote|pre|table|ul|ol)>/gi, '\n')
@@ -115,14 +147,30 @@ function htmlToTextInline(s: string) {
 async function readCapped(res: Response): Promise<string> {
   const len = Number(res.headers.get('content-length') ?? 0);
   if (len > MAX_BYTES) throw new Error(`Document is too large (${Math.round(len / 1e6)} MB)`);
-  return res.text();
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BYTES) {
+      await reader.cancel();
+      throw new Error('Document is too large');
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) (all.set(c, off), (off += c.byteLength));
+  return new TextDecoder().decode(all);
 }
 
 async function fetchWeb(src: SourceRow, deps: SourceFetchDeps): Promise<FetchOutcome> {
-  const res = await timedFetch(deps.fetch, src.url, { headers: { 'user-agent': 'ProjectDashboard/1.0 (+source check)', accept: 'text/html,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.5' } });
+  const { res, finalUrl } = await timedFetch(deps.fetch, src.url, { headers: { 'user-agent': 'ProjectDashboard/1.0 (+source check)', accept: 'text/html,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.5' } });
   if (res.status === 401 || res.status === 403) return { ok: false, connection: 'error', error: `HTTP ${res.status}: the page requires sign-in or denies access` };
   if (!res.ok) return { ok: false, connection: 'error', error: `HTTP ${res.status}` };
-  const finalUrl = res.url || src.url;
   const body = await readCapped(res);
   const type = res.headers.get('content-type') ?? '';
   if (/html/i.test(type) || /^\s*<(!doctype|html)/i.test(body)) {
@@ -144,7 +192,7 @@ async function fetchGithub(src: SourceRow, deps: SourceFetchDeps): Promise<Fetch
     .join('/')}${c.ref ? `?ref=${encodeURIComponent(c.ref)}` : ''}`;
   const headers: Record<string, string> = { accept: 'application/vnd.github.raw+json', 'user-agent': 'ProjectDashboard/1.0', 'x-github-api-version': '2022-11-28' };
   if (deps.config.githubToken) headers.authorization = `Bearer ${deps.config.githubToken}`;
-  const res = await timedFetch(deps.fetch, url, { headers });
+  const { res } = await timedFetch(deps.fetch, url, { headers });
   if ((res.status === 404 || res.status === 401 || res.status === 403) && !deps.config.githubToken) {
     return { ok: false, connection: 'needs_setup', error: `GitHub returned ${res.status}. For a private repository set the GITHUB_TOKEN secret (read-only, contents scope).` };
   }
@@ -166,14 +214,14 @@ async function fetchNotion(src: SourceRow, deps: SourceFetchDeps): Promise<Fetch
   if (!deps.config.notionToken) return { ok: false, connection: 'needs_setup', error: 'Set the NOTION_TOKEN secret and share the page with that integration.' };
   const c = parseJson<Record<string, string>>(src.config, {});
   const headers = { authorization: `Bearer ${deps.config.notionToken}`, 'notion-version': '2022-06-28', accept: 'application/json' };
-  const page = await timedFetch(deps.fetch, `https://api.notion.com/v1/pages/${c.page_id}`, { headers });
+  const { res: page } = await timedFetch(deps.fetch, `https://api.notion.com/v1/pages/${c.page_id}`, { headers });
   if (page.status === 404 || page.status === 403) return { ok: false, connection: 'needs_setup', error: 'Notion page not shared with the integration (Share → Connections).' };
   if (!page.ok) return { ok: false, connection: 'error', error: `Notion HTTP ${page.status}` };
   const lines: string[] = [];
   let cursor: string | undefined;
   let pages = 0;
   do {
-    const res = await timedFetch(deps.fetch, `https://api.notion.com/v1/blocks/${c.page_id}/children?page_size=100${cursor ? `&start_cursor=${cursor}` : ''}`, { headers });
+    const { res } = await timedFetch(deps.fetch, `https://api.notion.com/v1/blocks/${c.page_id}/children?page_size=100${cursor ? `&start_cursor=${cursor}` : ''}`, { headers });
     if (!res.ok) return { ok: false, connection: 'error', error: `Notion blocks HTTP ${res.status}` };
     const body = (await res.json()) as { results: NotionBlock[]; has_more: boolean; next_cursor: string | null };
     for (const b of body.results) {
@@ -194,7 +242,7 @@ export async function fetchSource(src: SourceRow, deps: SourceFetchDeps): Promis
       case 'reference':
         return { ok: false, connection: 'reference_only', error: classifyUrl(src.url, deps.config).note || 'Reference link only.' };
       case 'snapshot':
-        return { ok: true, text: `Snapshot as of ${src.as_of ?? 'unknown date'}:\n${src.snapshot_text}`, truncated: false };
+        return { ok: true, text: src.snapshot_text, truncated: false };
       case 'web':
         return await fetchWeb(src, deps);
       case 'github':
@@ -229,7 +277,10 @@ export function normaliseForQuote(s: string): string {
     .trim();
 }
 
+export const MIN_QUOTE_CHARS = 20;
+
+/** A quote counts as evidence only if it is substantial (≥20 chars, ≥3 words) and appears verbatim in the text. */
 export function quoteIsGrounded(quote: string, sourceText: string): boolean {
   const q = normaliseForQuote(quote);
-  return q.length >= 8 && normaliseForQuote(sourceText).includes(q);
+  return q.length >= MIN_QUOTE_CHARS && q.split(' ').length >= 3 && normaliseForQuote(sourceText).includes(q);
 }

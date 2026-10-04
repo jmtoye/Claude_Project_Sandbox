@@ -55,7 +55,8 @@ ChatGPT Spaces/Pages have no supported read API, and signed-in pages are not scr
   - **Owner** (`OWNER_EMAIL`): everything.
   - **Grants**: per space, `view` (default) or `edit`, given separately.
   - **Personal** grants are honoured only for emails in `PERSONAL_ALLOWED_EMAILS` (you + Renata). This is checked both when granting and on every request.
-  - **Editors** can edit content, pin, pause/resume, attach sources and trigger refreshes. Only the owner can add, complete, archive, reopen or delete projects, toggle **Only me**, and manage access.
+  - **Editors** can edit content, pin, pause/resume, attach web pages and snapshots, and trigger refreshes. Only the owner can add, complete, archive, reopen or delete projects, toggle **Only me**, manage access, and attach **GitHub/Notion** sources (those are read with the owner's server-side credentials).
+  - Web sources are fetched only from public addresses (no localhost or private ranges, re-checked on every redirect), with a 3 MB cap.
 - **"Only me"** is enforced by one SQL predicate, `projectScope()`: `only_me = 0 AND space IN (granted spaces)` for everyone except the owner. Every read uses it:
   - dashboards, archive, counts, maps (both ends of each edge), search, detail and direct URLs;
   - dependencies, history, suggestions, daily summaries (filtered again when read), the change-detection etag, the context given to the natural-language interpreter, and every MCP tool.
@@ -101,12 +102,13 @@ Completed and archived projects live in the reopenable **Archive**.
 
 ## Automatic updates
 
-- **Hourly.** A Cron Trigger runs `0 * * * *` UTC, independent of any browser. Each run:
+- **Hourly.** A Cron Trigger runs `0 * * * *` UTC, independent of any browser. Each run builds any due daily summaries first, then refreshes sources. The refresh:
   - checks connected sources (within a per-run budget);
   - compares content hashes. Unchanged means "checked, no changes": no edits and no LLM call;
-  - sends changed text, with its added/removed lines and the current record, to Claude using a strict JSON schema;
+  - sends changed text, with its added/removed lines and the current record, to Claude using a strict JSON schema. The candidate list for dependency mentions never includes "Only me" projects, unless the project being processed is itself "Only me";
   - applies the proposal (`updater/apply.ts`) only where grounded:
-    - quotes must appear verbatim in the fetched text;
+    - quotes must appear verbatim in the fetched text, and be at least 20 characters and 3 words;
+    - status changes and milestone completions must quote text that is *new* in this change; old, unchanged lines don't count;
     - fields under manual override are never changed, and a reviewable *override conflict* suggestion is recorded instead;
     - uncited "blockers" are downgraded to anticipated risks;
     - deadlines become suggestions;
@@ -114,7 +116,8 @@ Completed and archived projects live in the reopenable **Archive**.
 - **Safe to retry.**
   - Each run has a unique idempotency key (`cron:2026-10-04T23`). A retried trigger returns the existing run.
   - A lease lock prevents concurrent runs.
-  - Per-project writes are one atomic D1 batch guarded by the project version. A concurrent manual edit forces a re-plan with the fresh overrides.
+  - Per-project writes are one atomic D1 batch guarded by the project version. A concurrent manual edit forces a re-plan with the fresh overrides; changes already applied, or whose source was removed meanwhile, are skipped.
+  - A failing project is recorded and skipped without aborting the run. The lock is renewed during long runs. New project updates stop after about 9 minutes; the rest wait for the next hour.
   - Source hashes only advance when the change was processed, so a failed summary is retried next hour.
 - **Failures.** A source that can't be read keeps the last known state, is flagged on the tile ("source unavailable · last known state shown"), and is logged once rather than every hour.
 - **No AI key.** Changes are detected and flagged "needs review", and nothing is inferred.

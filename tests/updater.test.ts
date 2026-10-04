@@ -68,7 +68,7 @@ describe('hourly checks', () => {
           { milestone_id: build.id, state: 'done', evidence: 'Deployed to production 4 Oct', citations: [{ source_id: input.changes[0].source_id, quote: 'The build was completed and deployed to production on 4 October.' }] },
           // Hallucinated evidence: the quote is not in the source → must not be applied.
           { milestone_id: golive.id, state: 'done', evidence: 'Went live', citations: [{ source_id: input.changes[0].source_id, quote: 'The system went live to all users' }] },
-          // A draft/approval is not implementation, but a grounded "approved" is fine for an approval milestone.
+          // Grounded but OLD text (unchanged since the last read) cannot complete a milestone now.
           { milestone_id: design.id, state: 'done', evidence: 'Approved by steering group', citations: [{ source_id: input.changes[0].source_id, quote: 'Phase one design was approved by the steering group' }] },
         ],
         next_steps: [{ title: 'Chase security sign-off', assignee: '', needs_decision: false, is_primary: true, basis: 'source_fact', citations: [{ source_id: input.changes[0].source_id, quote: 'waiting for the security sign-off' }] }],
@@ -84,7 +84,7 @@ describe('hourly checks', () => {
     const r = await runRefresh(h.deps, { trigger: 'cron', idemKey: 'b' });
     expect(r.stats.projects_updated).toBe(1);
     const after = await ms(h, id);
-    expect(after.map((m: any) => m.state)).toEqual(['done', 'done', 'not_started']);
+    expect(after.map((m: any) => m.state)).toEqual(['not_started', 'done', 'not_started']);
     expect(after[1].evidence_basis).toBe('auto_evidence');
     expect(after[1].deadline).toBe('2026-10-02'); // unchanged
     expect(after[2].deadline).toBeNull(); // found deadline is only a suggestion

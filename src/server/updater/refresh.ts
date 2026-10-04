@@ -18,7 +18,7 @@ import { loadBundles } from '../repo';
 import { hkDate } from '../time';
 import { clip, mapLimit, newId, sha256Hex } from '../util';
 import { planApply } from './apply';
-import type { SourceChange, UpdateInput } from './llm';
+import type { SourceChange, UpdateInput, UpdateProposal } from './llm';
 import { fetchSource, lineDiff, type FetchOutcome } from './sources';
 
 export interface RefreshStats {
@@ -29,6 +29,7 @@ export interface RefreshStats {
   projects_updated: number;
   llm_calls: number;
   llm_errors: number;
+  project_errors: number;
   deferred: number;
 }
 
@@ -41,6 +42,8 @@ export interface RefreshResult {
 }
 
 const LOCK_MS = 14 * 60_000;
+/** Stop starting new project updates after this long; the rest are picked up next hour. */
+const TIME_BUDGET_MS = 9 * 60_000;
 
 export async function acquireLock(deps: Deps, name: string, holder: string, ms = LOCK_MS): Promise<boolean> {
   const now = deps.now();
@@ -53,11 +56,15 @@ export async function acquireLock(deps: Deps, name: string, holder: string, ms =
   return r.changes === 1;
 }
 
+async function renewLock(deps: Deps, name: string, holder: string, ms = LOCK_MS) {
+  await deps.db.run('UPDATE locks SET expires_at = ? WHERE name = ? AND holder = ?', [new Date(deps.now().getTime() + ms).toISOString(), name, holder]);
+}
+
 export async function releaseLock(deps: Deps, name: string, holder: string) {
   await deps.db.run('DELETE FROM locks WHERE name = ? AND holder = ?', [name, holder]);
 }
 
-const emptyStats = (): RefreshStats => ({ projects: 0, sources_checked: 0, sources_changed: 0, sources_failed: 0, projects_updated: 0, llm_calls: 0, llm_errors: 0, deferred: 0 });
+const emptyStats = (): RefreshStats => ({ projects: 0, sources_checked: 0, sources_changed: 0, sources_failed: 0, projects_updated: 0, llm_calls: 0, llm_errors: 0, project_errors: 0, deferred: 0 });
 
 function needsCheck(s: SourceRow): boolean {
   if (s.kind === 'reference') return false;
@@ -110,10 +117,31 @@ export async function runRefresh(
       g.items.push({ s: f.s, out: f.out });
     }
     stats.projects = byProject.size;
-    const otherProjects = (space: string, id: string) => bundles.filter((x) => x.project.space === space && x.project.id !== id).map((x) => ({ id: x.project.id, name: x.project.name }));
+    // Candidate projects for dependency mentions: same space, and never an "Only me" project
+    // unless the project being processed is itself "Only me" (its output may be seen by others).
+    const otherProjects = (b: ProjectBundle) =>
+      bundles
+        .filter((x) => x.project.space === b.project.space && x.project.id !== b.project.id && (!x.project.only_me || b.project.only_me))
+        .map((x) => ({ id: x.project.id, name: x.project.name }));
 
-    await mapLimit([...byProject.values()], 3, (g) => processProject(deps, runId, g.b, g.items, stats, otherProjects(g.b.project.space, g.b.project.id)));
-    if (stats.sources_failed || stats.llm_errors) status = 'partial';
+    const started = deps.now().getTime();
+    const errors: string[] = [];
+    await mapLimit([...byProject.values()], 3, async (g) => {
+      if (deps.now().getTime() - started > TIME_BUDGET_MS) {
+        stats.deferred += g.items.length;
+        return;
+      }
+      try {
+        await processProject(deps, runId, g.b, g.items, stats, otherProjects(g.b));
+      } catch (err) {
+        // One project's failure never aborts the run or releases the lock early.
+        stats.project_errors++;
+        errors.push(`${g.b.project.id}: ${String((err as Error)?.message ?? err).slice(0, 160)}`);
+      }
+      await renewLock(deps, 'refresh', runId);
+    });
+    if (errors.length) error = errors.join('; ').slice(0, 500);
+    if (stats.sources_failed || stats.llm_errors || stats.project_errors) status = 'partial';
   } catch (err) {
     status = 'failed';
     error = String((err as Error)?.message ?? err).slice(0, 500);
@@ -144,8 +172,7 @@ async function processProject(
   const today = hkDate(deps.now());
   const p = bundle.project;
   const statusStmts: Stmt[] = [];
-  const changes: SourceChange[] = [];
-  const changeStmts: Stmt[] = [];
+  const pending: { change: SourceChange; hash: string }[] = [];
 
   for (const { s, out } of items) {
     if (!out.ok) {
@@ -172,71 +199,83 @@ async function processProject(
     stats.sources_changed++;
     const prev = await db.first<{ text: string }>('SELECT text FROM source_content WHERE source_id = ?', [s.id]);
     const diff = prev ? lineDiff(prev.text, out.text) : { added: [], removed: [] };
-    changes.push({ source_id: s.id, title: s.title, kind: s.kind, as_of: s.as_of, first_time: !prev, added: diff.added.slice(0, 400), removed: diff.removed.slice(0, 400), text: out.text, truncated: out.truncated });
-    changeStmts.push(
-      {
-        sql: "UPDATE sources SET content_hash = ?, connection = 'connected', last_error = '', consecutive_failures = 0, last_checked_at = ?, last_success_at = ?, last_changed_at = ?, updated_at = ? WHERE id = ?",
-        params: [hash, now, now, now, now, s.id],
-      },
-      {
-        sql: `INSERT INTO source_content (source_id, content_hash, text, fetched_at, truncated) VALUES (?, ?, ?, ?, ?)
-              ON CONFLICT(source_id) DO UPDATE SET content_hash = excluded.content_hash, text = excluded.text, fetched_at = excluded.fetched_at, truncated = excluded.truncated`,
-        params: [s.id, hash, out.text, now, out.truncated ? 1 : 0],
-      },
-    );
+    pending.push({
+      hash,
+      change: { source_id: s.id, title: s.title, kind: s.kind, as_of: s.as_of, first_time: !prev, added: diff.added.slice(0, 400), removed: diff.removed.slice(0, 400), text: out.text, truncated: out.truncated },
+    });
   }
 
   // Source health + "checked" timestamp (no project content changes).
   statusStmts.push({ sql: 'UPDATE projects SET last_checked_at = ? WHERE id = ?', params: [now, p.id] });
   await db.batch(statusStmts);
-  if (!changes.length) return;
+  if (!pending.length) return;
 
-  const changedTitles = changes.map((c) => c.title).join(', ');
-  const diffNote = changes.map((c) => (c.first_time ? `${c.title}: first read` : `${c.title}: +${c.added.length}/−${c.removed.length} lines`)).join('; ');
-
-  if (!deps.llm) {
-    await commitWithGuard(deps, p.id, p.version, [
-      ...changeStmts,
-      { sql: 'UPDATE projects SET needs_review = 1 WHERE id = ?', params: [p.id] },
-      historyStmt(p.id, now, 'auto_update', `Source changed (${diffNote}). Automatic summarisation is not configured, so nothing was inferred — please review.`, { sources: changes.map((c) => ({ id: c.source_id, title: c.title })) }, runId),
-    ]);
-    stats.projects_updated++;
-    return;
-  }
-
-  let proposal;
-  try {
-    stats.llm_calls++;
-    proposal = await deps.llm.proposeUpdate(buildInput(bundle, changes, today, otherProjects));
-  } catch (err) {
-    stats.llm_errors++;
-    const msg = clip(String((err as Error)?.message ?? err), 200);
-    // Source hashes are NOT advanced, so the next hourly run retries the summary.
-    await commitWithGuard(deps, p.id, p.version, [
-      { sql: 'UPDATE projects SET needs_review = 1 WHERE id = ?', params: [p.id] },
-      ...(p.needs_review ? [] : [historyStmt(p.id, now, 'auto_update', `Source changed (${changedTitles}) but the automatic summary failed: ${msg}. It will be retried next hour.`, {}, runId)]),
-    ]).catch(() => undefined);
-    return;
+  let proposal: UpdateProposal | null = null;
+  if (deps.llm) {
+    try {
+      stats.llm_calls++;
+      proposal = await deps.llm.proposeUpdate(buildInput(bundle, pending.map((x) => x.change), today, otherProjects));
+    } catch (err) {
+      stats.llm_errors++;
+      const msg = clip(String((err as Error)?.message ?? err), 200);
+      // Source hashes are NOT advanced, so the next hourly run retries the summary.
+      await db.batch([
+        { sql: 'UPDATE projects SET needs_review = 1 WHERE id = ?', params: [p.id] },
+        ...(p.needs_review ? [] : [historyStmt(p.id, now, 'auto_update', `Source changed (${pending.map((x) => x.change.title).join(', ')}) but the automatic summary failed: ${msg}. It will be retried next hour.`, {}, runId)]),
+      ]);
+      return;
+    }
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const fresh = attempt === 0 ? bundle : (await loadBundles(db, systemPrincipal(), { ids: [p.id] }))[0];
-    if (!fresh) return;
-    const deps2 = await db.all<{ d: string }>('SELECT depends_on_id AS d FROM dependencies WHERE project_id = ?', [p.id]);
-    const plan = planApply({ bundle: fresh, proposal, changes, today, now, runId, otherProjects, existingDeps: new Set(deps2.map((r) => r.d)) });
-    const summary = plan.material
-      ? proposal.change_summary || `Sources updated: ${changedTitles}`
-      : `Checked ${changedTitles}: source text changed but nothing material for this project.`;
-    const hist = historyStmt(
-      p.id,
-      now,
-      'auto_update',
-      summary,
-      { applied: plan.applied, suppressed: plan.suppressed, citations: plan.citations, sources: changes.map((c) => ({ id: c.source_id, title: c.title, diff: c.first_time ? 'first read' : `+${c.added.length}/−${c.removed.length}` })), model: deps.llm.model },
-      runId,
-    );
+    if (!fresh) return; // project deleted meanwhile
+    // Skip changes already applied by another run, or whose source was removed meanwhile.
+    const live = pending.filter((x) => {
+      const src = fresh.sources.find((y) => y.id === x.change.source_id);
+      return src && src.content_hash !== x.hash;
+    });
+    if (!live.length) return;
+    const changes = live.map((x) => x.change);
+    const changedTitles = changes.map((c) => c.title).join(', ');
+    const sourceStmts = live.flatMap((x): Stmt[] => [
+      {
+        sql: "UPDATE sources SET content_hash = ?, connection = 'connected', last_error = '', consecutive_failures = 0, last_checked_at = ?, last_success_at = ?, last_changed_at = ?, updated_at = ? WHERE id = ?",
+        params: [x.hash, now, now, now, now, x.change.source_id],
+      },
+      {
+        sql: `INSERT INTO source_content (source_id, content_hash, text, fetched_at, truncated) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(source_id) DO UPDATE SET content_hash = excluded.content_hash, text = excluded.text, fetched_at = excluded.fetched_at, truncated = excluded.truncated`,
+        params: [x.change.source_id, x.hash, x.change.text, now, x.change.truncated ? 1 : 0],
+      },
+    ]);
+    let stmts: Stmt[];
+    if (!proposal) {
+      const diffNote = changes.map((c) => (c.first_time ? `${c.title}: first read` : `${c.title}: +${c.added.length}/−${c.removed.length} lines`)).join('; ');
+      stmts = [
+        ...sourceStmts,
+        { sql: 'UPDATE projects SET needs_review = 1 WHERE id = ?', params: [p.id] },
+        historyStmt(p.id, now, 'auto_update', `Source changed (${diffNote}). Automatic summarisation is not configured, so nothing was inferred — please review.`, { sources: changes.map((c) => ({ id: c.source_id, title: c.title })) }, runId),
+      ];
+    } else {
+      const deps2 = await db.all<{ d: string }>('SELECT depends_on_id AS d FROM dependencies WHERE project_id = ?', [p.id]);
+      const plan = planApply({ bundle: fresh, proposal, changes, today, now, runId, otherProjects, existingDeps: new Set(deps2.map((r) => r.d)) });
+      const summary = plan.material ? proposal.change_summary || `Sources updated: ${changedTitles}` : `Checked ${changedTitles}: source text changed but nothing material for this project.`;
+      stmts = [
+        ...plan.stmts,
+        ...sourceStmts,
+        historyStmt(
+          p.id,
+          now,
+          'auto_update',
+          summary,
+          { applied: plan.applied, suppressed: plan.suppressed, citations: plan.citations, sources: changes.map((c) => ({ id: c.source_id, title: c.title, diff: c.first_time ? 'first read' : `+${c.added.length}/−${c.removed.length}` })), model: deps.llm!.model },
+          runId,
+        ),
+      ];
+    }
     try {
-      await commitWithGuard(deps, p.id, fresh.project.version, [...plan.stmts, ...changeStmts, hist]);
+      await commitWithGuard(deps, p.id, fresh.project.version, stmts);
       stats.projects_updated++;
       return;
     } catch (err) {
